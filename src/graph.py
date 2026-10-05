@@ -54,9 +54,32 @@ def normalize_crime(name: str) -> str:
 
 def link_entity(name: str, known: list[str], normalize: Callable[[str], str] = normalize_crime) -> str | None:
     """Map a free-text mention (e.g. a charge written by a journalist) onto one canonical name in `known`."""
-    # TODO KG-1: normalize both sides, exact match first, then difflib.get_close_matches(cutoff=0.8).
-    #            Return the ORIGINAL spelling from `known`; return None when nothing is close enough.
-    raise NotImplementedError("TODO KG-1 link_entity (src/graph.py) - kiểm tra: pytest tests/test_graph.py -k LinkEntity")
+    if not name or not known:
+        return None
+
+    normalized_name = normalize(name)
+    if not normalized_name:
+        return None
+
+    # Preserve the first original spelling when multiple values normalize to
+    # the same text. The public contract requires returning an item from
+    # ``known``, not its normalized form.
+    originals_by_normalized: dict[str, str] = {}
+    for candidate in known:
+        normalized_candidate = normalize(candidate)
+        if normalized_candidate:
+            originals_by_normalized.setdefault(normalized_candidate, candidate)
+
+    if normalized_name in originals_by_normalized:
+        return originals_by_normalized[normalized_name]
+
+    matches = difflib.get_close_matches(
+        normalized_name,
+        list(originals_by_normalized),
+        n=1,
+        cutoff=0.8,
+    )
+    return originals_by_normalized[matches[0]] if matches else None
 
 def find_substances(text: str) -> list[str]:
     lowered = text.lower()
@@ -248,32 +271,91 @@ class Neo4jGraph:
 
     def context(self, question: str, doc_ids: list[str], max_facts: int = 60) -> list[str]:
         """Graph facts for a question: seeds + 1 hop, then the legal basis of every case reached."""
-        # TODO KG-3: multi-hop retrieval over YOUR ontology.
-        #   1. self.seed_facts(question, doc_ids) -> (seed_ids, facts)   (ontology-independent, already written)
-        #   2. From the seeds, walk to the other KB through your bridge node (Cypher, see LAB_GUIDE Bước 5)
-        #   3. Append one readable string per fact; return the list.
-        #
-        # HINT (suggested ontology):
-        #   a. Cases that are a seed or next to one -> add f"Vụ việc '{name}': {summary}" to facts
-        #        MATCH (k:Case) WHERE elementId(k) IN $ids OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
-        #   b. For those cases follow
-        #        (Case)-[:CHARGED_WITH]->(Crime)<-[:DEFINES]-(Article)-[:HAS_CLAUSE]->(Clause)
-        #      keep clause 1 + clauses that MENTION a Substance the case INVOLVES
-        #   c. Articles named in the question ("Điều 251" -> re.findall(r"[Đđ]iều (\d+)", question)):
-        #      clause 1 + clauses mentioning find_substances(question)
-        #   d. One fact per clause: f"[{article_id} - {title}] khoản {number}: {text}"
-        raise NotImplementedError("TODO KG-3 Neo4jGraph.context (src/graph.py) - kiểm tra: python bench_kg.py --check")
+        seed_ids, seed_edge_facts = self.seed_facts(question, doc_ids, limit=max_facts)
+
+        cases = self.run(
+            """
+            MATCH (k:Case)
+            WHERE elementId(k) IN $ids
+               OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
+            RETURN DISTINCT elementId(k) AS id, k.name AS name, k.summary AS summary,
+                   k.date AS date, k.source_title AS source_title
+            ORDER BY name
+            """,
+            ids=seed_ids,
+        )
+        case_ids = [row["id"] for row in cases]
+
+        case_facts = []
+        for case in cases:
+            details = case.get("summary") or case.get("source_title") or ""
+            date = f" (ngày {case['date']})" if case.get("date") else ""
+            case_facts.append(f"Vụ việc '{case['name']}'{date}: {details}".rstrip())
+
+        # Besides vector-derived seeds, recognize an article explicitly named
+        # in the question so a query such as "Điều 251" is deterministic.
+        article_numbers = re.findall(r"[Đđ]iều\s+(\d+)", question)
+        legal_rows = self.run(
+            """
+            MATCH (a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+            WHERE elementId(a) IN $ids
+               OR EXISTS { MATCH (s)--(a) WHERE elementId(s) IN $ids }
+               OR any(number IN $article_numbers WHERE a.id STARTS WITH 'Điều ' + number + ' ')
+               OR EXISTS {
+                    MATCH (k:Case)-[:CHARGED_WITH]->(:Crime)<-[:DEFINES]-(a)
+                    WHERE elementId(k) IN $case_ids
+               }
+            RETURN DISTINCT a.id AS article_id, a.title AS title,
+                   cl.number AS number, cl.penalty AS penalty, cl.text AS text
+            ORDER BY article_id, number
+            """,
+            ids=seed_ids,
+            case_ids=case_ids,
+            article_numbers=article_numbers,
+        )
+        legal_facts = [
+            f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}"
+            for row in legal_rows
+        ]
+
+        # Put the multi-hop results first: they are the information vector RAG
+        # cannot obtain reliably. Keep insertion order while removing repeats.
+        facts: list[str] = []
+        seen: set[str] = set()
+        for fact in case_facts + legal_facts + seed_edge_facts:
+            if fact and fact not in seen:
+                facts.append(fact)
+                seen.add(fact)
+            if len(facts) >= max_facts:
+                break
+        return facts
 
 # ---------------------------------------------------------------------------------------------- KG-2
 
 def build_graph(graph: Neo4jGraph, law_docs: list[Document], news_docs: list[Document],
                 llm_fn: Callable[..., str]) -> None:
     """Load both KBs into an empty graph. llm_fn(prompt, json_mode=False) -> str (metered OpenAI chat)."""
-    # TODO KG-2: create YOUR ontology in Neo4j from both KBs.
-    #   Contract: every node created from one document has the property doc_id = Document.id.
-    #   Fastest start: the HINT helpers above (parse_law_article, extract_news_cases, suggested_constraints,
-    #   add_law_article, add_news_case). Own ontology + report/ONTOLOGY.md = bonus (SUBMISSION.md).
-    raise NotImplementedError("TODO KG-2 build_graph (src/graph.py) - kiểm tra: python bench_kg.py --build --limit 2")
+    graph.suggested_constraints()
+
+    # Law articles have a stable layout, so deterministic extraction is both
+    # cheaper and more reliable than asking an LLM to parse them.
+    articles = [parse_law_article(doc) for doc in law_docs]
+    for article in articles:
+        graph.add_law_article(article)
+
+    # These canonical names form the Crime bridge between the two KBs.
+    known_crimes = [article["crime"] for article in articles if article["crime"]]
+
+    # News is free-form prose. Extract it with the metered JSON-mode LLM, then
+    # link every extracted charge back to one of the canonical law crimes.
+    for doc in news_docs:
+        cases = extract_news_cases(
+            doc,
+            lambda prompt: llm_fn(prompt, json_mode=True),
+            known_crimes,
+        )
+        for case in cases:
+            graph.add_news_case(case, doc)
 
 # ---------------------------------------------------------------------------------------------- KG-4
 
@@ -298,6 +380,25 @@ class GraphRAGAgent:
         self.llm_fn = llm_fn
 
     def answer(self, question: str, top_k: int = 3) -> str:
-        # TODO KG-4: vector top-k (same as flat RAG) -> doc_ids of the hits -> self.graph.context(question, doc_ids)
-        #            -> fill GRAPH_PROMPT -> self.llm_fn(prompt)
-        raise NotImplementedError("TODO KG-4 GraphRAGAgent.answer (src/graph.py) - kiểm tra: pytest tests/test_graph.py -k GraphRAGAgent")
+        chunks = self.store.search(question, top_k=top_k)
+
+        # dict preserves retrieval order while removing duplicate documents
+        # when several chunks originate from the same source.
+        doc_ids = list(dict.fromkeys(
+            chunk["metadata"]["doc_id"]
+            for chunk in chunks
+            if chunk.get("metadata", {}).get("doc_id")
+        ))
+        facts = self.graph.context(question, doc_ids)
+
+        graph_context = "\n".join(f"- {fact}" for fact in facts)
+        chunk_context = "\n\n".join(
+            f"[{index}] {chunk['content']}"
+            for index, chunk in enumerate(chunks, start=1)
+        )
+        prompt = GRAPH_PROMPT.format(
+            facts=graph_context,
+            chunks=chunk_context,
+            question=question,
+        )
+        return self.llm_fn(prompt)
